@@ -1,0 +1,9 @@
+db:
+  user-shards:
+    0: "postgres://user:userpassword@localhost:5433/users_0000"
+    1: "postgres://user:userpassword@localhost:5433/users_0001"
+    2: "postgres://user:userpassword@localhost:5433/users_0002"
+    3: "postgres://user:userpassword@localhost:5433/users_0003"
+  email-shards:
+    0: "postgres://user:userpassword@localhost:5433/emails_0000"
+    1: "postgres://user:userpassword@localhost:5433/emails_0001"
