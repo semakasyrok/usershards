@@ -4,12 +4,9 @@ import (
 	"context"
 	"go.temporal.io/sdk/client"
 	"log"
-	"time"
-
 	"usershards/internal/config"
 	"usershards/internal/logger"
-	"usershards/internal/saga"
-	"usershards/internal/services"
+	"usershards/internal/profile"
 	"usershards/internal/shard"
 )
 
@@ -21,6 +18,8 @@ func main() {
 }
 
 func run() error {
+	profile.StartPprof()
+
 	logger.InitLogger()
 	defer logger.Logger.Sync()
 
@@ -45,14 +44,15 @@ func run() error {
 	defer temporalClient.Close()
 	logger.Logger.Info("Connected to Temporal successfully")
 
-	userService := services.NewUserService(shardManager, temporalClient)
-
-	worker := saga.NewWorker(temporalClient, userService)
-	defer worker.Stop()
-
-	tctx, cancel := context.WithTimeout(ctx, time.Second*10)
-	defer cancel()
-	_, err = userService.CreateUser(tctx, "+7823434335", "bob@qaz.ru")
+	//userService := services.NewUserService(shardManager, temporalClient)
+	//simpleService := services.NewSimpleService()
+	//
+	//worker, _ := saga.NewWorker(temporalClient, simpleService, userService)
+	//defer worker.Stop()
+	//
+	//tctx, cancel := context.WithTimeout(ctx, time.Second*10)
+	//defer cancel()
+	//_, err = userService.CreateUser(tctx, "+7823434335", "bob@qaz.ru")
 
 	select {}
 

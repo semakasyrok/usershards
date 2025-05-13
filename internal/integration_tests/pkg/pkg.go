@@ -2,7 +2,6 @@ package pkg
 
 import (
 	"context"
-	"go.temporal.io/sdk/worker"
 	"testing"
 	"time"
 	"usershards/internal/saga"
@@ -19,11 +18,15 @@ type TestDeps struct {
 	ShardManager   *shard.ShardManager
 	TemporalClient client.Client
 	UserService    *services.UserService
-	Worker         *worker.Worker
+	UserSaga       *saga.UserSagaWorkflow
+}
+
+type Setup struct {
+	SetupUserService func(shardManager *shard.ShardManager) *services.UserService
 }
 
 // SetupTest инициализирует зависимости для тестирования
-func SetupTest(t *testing.T) *TestDeps {
+func SetupTest(t *testing.T, setupSet Setup) *TestDeps {
 	t.Helper()
 	logger.InitLogger()
 
@@ -53,14 +56,16 @@ func SetupTest(t *testing.T) *TestDeps {
 	}
 	logger.Logger.Info("Connected to Temporal successfully")
 
-	userService := services.NewUserService(shardManager, temporalClient)
+	userService := services.NewUserService(shardManager)
+	userSaga := saga.NewUserSagaWorkflow(userService, temporalClient)
 
-	worker := saga.NewWorker(temporalClient, userService)
-	defer worker.Stop()
+	w1, w2 := saga.NewWorker(temporalClient, userSaga)
 
 	// Очищаем ресурсы после теста
 	t.Cleanup(func() {
-		worker.Stop()
+		t.Log("Cleaning up temporal client")
+		w1.Stop()
+		w2.Stop()
 		temporalClient.Close()
 		shardManager.Close()
 	})
@@ -72,6 +77,6 @@ func SetupTest(t *testing.T) *TestDeps {
 		ShardManager:   shardManager,
 		TemporalClient: temporalClient,
 		UserService:    userService,
-		Worker:         &worker,
+		UserSaga:       userSaga,
 	}
 }

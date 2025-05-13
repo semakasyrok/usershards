@@ -3,6 +3,7 @@ package shard
 import (
 	"context"
 	"fmt"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"hash/crc32"
 	"usershards/internal/config"
@@ -10,6 +11,36 @@ import (
 	"usershards/migrations/emails"
 	"usershards/migrations/users"
 )
+
+// TxFunc defines the function signature for transaction operations.
+type TxFunc func(tx pgx.Tx) error
+
+// WithTransaction executes a function within a database transaction.
+func WithTransaction(ctx context.Context, db *pgxpool.Pool, fn TxFunc) error {
+	tx, err := db.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %w", err)
+	}
+
+	// Ensure rollback if the function returns an error
+	defer func() {
+		if p := recover(); p != nil {
+			_ = tx.Rollback(ctx)
+			panic(p) // Re-panic after rollback
+		}
+	}()
+
+	if err := fn(tx); err != nil {
+		_ = tx.Rollback(ctx)
+		return fmt.Errorf("transaction failed: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit transaction: %w", err)
+	}
+
+	return nil
+}
 
 type ShardManager struct {
 	UserShards  map[int]*pgxpool.Pool
@@ -35,7 +66,7 @@ func NewShardManager(ctx context.Context, config *config.Config) (*ShardManager,
 			return nil, fmt.Errorf("failed to ping user shard %d: %w", shardID, err)
 		}
 
-		err = RunMigrations(conn, users.Migration)
+		err = RunMigrations(conn, users.Migration1, users.Migration2, users.Migration3)
 		if err != nil {
 			return nil, fmt.Errorf("failed to run migrations: %w", err)
 		}
@@ -55,7 +86,7 @@ func NewShardManager(ctx context.Context, config *config.Config) (*ShardManager,
 			return nil, fmt.Errorf("failed to ping email shard %d: %w", shardID, err)
 		}
 
-		err = RunMigrations(conn, emails.Migration)
+		err = RunMigrations(conn, emails.Migration1, emails.Migration2)
 		if err != nil {
 			return nil, fmt.Errorf("failed to run migrations: %w", err)
 		}
@@ -96,13 +127,12 @@ func (sm *ShardManager) HashEmail(email string) int {
 }
 
 // RunMigrations выполняет SQL-скрипты миграции
-func RunMigrations(conn *pgxpool.Pool, migration string) error {
-	sql := string(migration)
-
-	// Выполняем SQL
-	_, err := conn.Exec(context.Background(), sql)
-	if err != nil {
-		return fmt.Errorf("ошибка выполнения миграции: %w", err)
+func RunMigrations(conn *pgxpool.Pool, migrations ...string) error {
+	for _, migration := range migrations {
+		_, err := conn.Exec(context.Background(), migration)
+		if err != nil {
+			return fmt.Errorf("ошибка выполнения миграции: %w", err)
+		}
 	}
 
 	logger.Logger.Infof("migration successfuly executed")
@@ -113,6 +143,8 @@ func RunMigrations(conn *pgxpool.Pool, migration string) error {
 func (sm *ShardManager) ClearDatabases(ctx context.Context) error {
 	queries := []string{
 		"DELETE FROM users",
+		"DELETE FROM idempotence",
+		"DELETE FROM transaction",
 	}
 
 	for _, conn := range sm.UserShards {

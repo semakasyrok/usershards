@@ -4,83 +4,69 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
 	"github.com/jackc/pgx/v5"
-	"go.temporal.io/sdk/client"
-	"go.temporal.io/sdk/temporal"
-	"go.temporal.io/sdk/workflow"
-	"go.uber.org/zap"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/samber/lo"
 	"time"
+	"usershards/internal/apperrors"
 	"usershards/internal/id"
-	"usershards/internal/saga"
+	"usershards/internal/models"
 	"usershards/internal/shard"
 )
 
-func NewUserService(manager *shard.ShardManager, client client.Client) *UserService {
+const WelcomeBonus = 1000_00
+
+func NewUserService(manager *shard.ShardManager) *UserService {
 	return &UserService{
-		ShardManager:   manager,
-		TemporalClient: client,
+		ShardManager: manager,
 	}
 }
 
 type UserService struct {
-	ShardManager   *shard.ShardManager
-	TemporalClient client.Client
+	ShardManager *shard.ShardManager
 }
 
-// CreateUser создает пользователя через Temporal Workflow
-// https://temporal.io/blog/compensating-actions-part-of-a-complete-breakfast-with-sagas
-func (s *UserService) CreateUser(ctx context.Context, phone, email string) (int64, error) {
-	workflowOptions := client.StartWorkflowOptions{
-		ID:        fmt.Sprintf("create-user-%s", phone),
-		TaskQueue: saga.TaskQueue,
-	}
-	userID := id.GenerateUserID(s.ShardManager.HashPhoneNumber(phone))
+func (s *UserService) GetUserByID(ctx context.Context, userID int64) (*models.User, error) {
+	_, shardID, _ := id.ParseUserID(userID)
 
-	// Запускаем workflows
-	we, err := s.TemporalClient.ExecuteWorkflow(ctx, workflowOptions, s.CreateUserWorkflow, userID, phone, email)
+	usersDB, ok := s.ShardManager.UserShards[shardID]
+	if !ok {
+		return nil, fmt.Errorf("user shard %d not found for id %d", shardID, userID)
+	}
+
+	const query = `SELECT id, phone_number, email, balance, created_at, updated_at FROM users WHERE id = $1`
+
+	user := models.User{}
+	err := usersDB.QueryRow(ctx, query, userID).Scan(&user.ID, &user.Phone, &user.Email,
+		&user.Balance, &user.CreatedAt, &user.UpdatedAt)
 	if err != nil {
-		return 0, fmt.Errorf("failed to start workflows: %w", err)
+		return nil, fmt.Errorf("failed to get user: %w", err)
 	}
 
-	// Ожидаем завершения (синхронно)
-	var resUserID int64
-	err = we.Get(ctx, &resUserID)
-	if err != nil {
-		return 0, fmt.Errorf("failed to get workflows result: %w", err)
-	}
-
-	return resUserID, nil
+	return &user, nil
 }
 
-func (s *UserService) CreateUserWorkflow(ctx workflow.Context, userID int64, phone, email string) (res int64, err error) {
+func (s *UserService) MarkUserAsBlocked(ctx context.Context, userID int64) error {
+	_, shardID, _ := id.ParseUserID(userID)
 
-	options := s.getDefaultOptions()
-	ctx = workflow.WithActivityOptions(ctx, options)
-	logger := workflow.GetLogger(ctx)
-	logger.Debug("CreateUserWorkflow start")
-
-	logger.Debug("CreateEmailRecord start")
-	err = workflow.ExecuteActivity(ctx, s.CreateEmailRecord, userID, email).Get(ctx, nil)
-	if err != nil {
-		logger.Debug("CreateEmailRecord fails", zap.Error(err))
-		return 0, err
+	usersDB, ok := s.ShardManager.UserShards[shardID]
+	if !ok {
+		return fmt.Errorf("user shard %d not found for id %d", shardID, userID)
 	}
-	logger.Debug("CreateEmailRecord stop")
 
-	logger.Debug("CreateUserRecord start")
-	err = workflow.ExecuteActivity(ctx, s.CreateUserRecord, userID, phone, email).Get(ctx, nil)
+	const query = `UPDATE users SET is_blocked = true WHERE id = $1`
+
+	rows, err := usersDB.Exec(ctx, query, userID)
 	if err != nil {
-		delEmailErr := workflow.ExecuteActivity(ctx, s.DeleteEmailRecordIfPresentByUserID, email).Get(ctx, nil)
-		if delEmailErr != nil {
-			return 0, fmt.Errorf("failed to delete email record: %w", delEmailErr)
-		}
-		logger.Debug("CreateUserRecord fails", zap.Error(err))
-		return 0, err
+		return fmt.Errorf("failed to get user: %w", err)
 	}
-	logger.Debug("CreateUserRecord stop")
+	if rows.RowsAffected() != 1 {
+		return fmt.Errorf("expected 1 rows affected, got %d", rows.RowsAffected())
+	}
 
-	logger.Debug("CreateUserWorkflow completed")
-	return userID, nil
+	return nil
 }
 
 func (s *UserService) CreateUserRecord(ctx context.Context, userID int64, phone, email string) error {
@@ -91,8 +77,9 @@ func (s *UserService) CreateUserRecord(ctx context.Context, userID int64, phone,
 	}
 
 	now := time.Now().UTC()
+
 	_, err := usersDB.Exec(ctx, `INSERT INTO users (id, phone_number, email, balance, created_at, updated_at) 
-								 VALUES ($1, $2, $3, $4, $5, $6)`, userID, phone, email, 0, now, now)
+								 VALUES ($1, $2, $3, $4, $5, $6)`, userID, phone, email, WelcomeBonus, now, now)
 	if err != nil {
 		return fmt.Errorf("failed to insert user: %w", err)
 	}
@@ -145,15 +132,158 @@ func (s *UserService) CreateEmailRecord(ctx context.Context, userID int64, email
 	return nil
 }
 
-func (s *UserService) getDefaultOptions() workflow.ActivityOptions {
-	return workflow.ActivityOptions{
-		ScheduleToCloseTimeout: 10 * time.Second,
-		StartToCloseTimeout:    5 * time.Second,
-		RetryPolicy: &temporal.RetryPolicy{
-			InitialInterval:    1 * time.Second,
-			BackoffCoefficient: 2.0,
-			MaximumInterval:    5 * time.Second,
-			MaximumAttempts:    3,
-		},
+func (s *UserService) DecreaseMoneyFromUser(
+	ctx context.Context,
+	transactionID string,
+	transactionType models.TransactionType,
+	fromUserID,
+	toUserID int64,
+	amount int64,
+) error {
+	// Check for negative amount
+	if amount < 0 {
+		return fmt.Errorf("amount cannot be negative")
 	}
+
+	_, shardID, _ := id.ParseUserID(fromUserID)
+	userDB, ok := s.ShardManager.UserShards[shardID]
+	if !ok {
+		return fmt.Errorf("user shard %d not found", shardID)
+	}
+
+	now := time.Now().UTC()
+	err := shard.WithTransaction(ctx, userDB, func(tx pgx.Tx) error {
+		// check idempotentency key
+		const query = `INSERT INTO idempotence (id, type, created_at) VALUES ($1, $2, $3)`
+		_, err := tx.Exec(ctx, query, transactionID, transactionType, now)
+		if err != nil {
+			if pgErr, ok := lo.ErrorsAs[*pgconn.PgError](err); ok {
+				if pgErr.Code == pgerrcode.UniqueViolation {
+					return nil
+				}
+			}
+			return fmt.Errorf("failed to insert idempotetency: %w", err)
+		}
+
+		// select user to check balance and blocked status
+		var userIDFromDB uint64
+		var balance int64
+		var isBlocked bool
+		const selectUser = `SELECT id, balance, is_blocked FROM users WHERE id = $1 FOR UPDATE`
+		err = tx.QueryRow(ctx, selectUser, fromUserID).Scan(&userIDFromDB, &balance, &isBlocked)
+		if err != nil {
+			return fmt.Errorf("failed to select user: %w", err)
+		}
+
+		if isBlocked {
+			return apperrors.ErrUserIsBlocked
+		}
+
+		if balance < amount {
+			return fmt.Errorf("balance lower than amount of user")
+		}
+
+		// decrease user money
+		const decreaseMoney = `UPDATE users SET balance = balance - $1 WHERE id = $2`
+		rows, err := tx.Exec(ctx, decreaseMoney, amount, fromUserID)
+		if err != nil {
+			return fmt.Errorf("failed to update balance: %w", err)
+		}
+		if rows.RowsAffected() != 1 {
+			return fmt.Errorf("failed to update balance: expected 1 row affected, got %d", rows.RowsAffected())
+		}
+
+		// add transaction history
+		const addHistoryQuery = `INSERT INTO transaction 
+    							 (id, from_id, to_id, amount, created_at) 
+								 VALUES ($1, $2, $3, $4, $5)`
+		_, err = tx.Exec(ctx, addHistoryQuery, uuid.NewString(), fromUserID, toUserID, amount, now)
+		if err != nil {
+			return fmt.Errorf("failed to insert transaction history: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *UserService) IncreaseMoneyToUser(
+	ctx context.Context,
+	transactionID string,
+	transactionType models.TransactionType,
+	fromUserID,
+	toUserID int64,
+	amount int64,
+) error {
+	// Check for negative amount
+	if amount < 0 {
+		return fmt.Errorf("amount cannot be negative")
+	}
+
+	_, shardID, _ := id.ParseUserID(toUserID)
+	userDB, ok := s.ShardManager.UserShards[shardID]
+	if !ok {
+		return fmt.Errorf("user shard %d not found", shardID)
+	}
+
+	now := time.Now().UTC()
+	err := shard.WithTransaction(ctx, userDB, func(tx pgx.Tx) error {
+		// check idempotentency key
+		const query = `INSERT INTO idempotence (id, type, created_at) VALUES ($1, $2, $3)`
+		_, err := tx.Exec(ctx, query, transactionID, transactionType, now)
+		if err != nil {
+			if pgErr, ok := lo.ErrorsAs[*pgconn.PgError](err); ok {
+				if pgErr.Code == pgerrcode.UniqueViolation {
+					return nil
+				}
+			}
+			return fmt.Errorf("failed to insert idempotetency: %w", err)
+		}
+
+		// select user to check balance
+		var isBlocked bool
+		const selectUser = `SELECT is_blocked FROM users WHERE id = $1 FOR UPDATE`
+		err = tx.QueryRow(ctx, selectUser, toUserID).Scan(&isBlocked)
+		if err != nil {
+			return fmt.Errorf("failed to select user: %w", err)
+		}
+
+		if isBlocked {
+			return apperrors.ErrUserIsBlocked
+		}
+
+		// increase user money
+		const increaseMoney = `UPDATE users SET balance = balance + $1 WHERE id = $2`
+		rows, err := tx.Exec(ctx, increaseMoney, amount, toUserID)
+		if err != nil {
+			return fmt.Errorf("failed to update balance: %w", err)
+		}
+		if rows.RowsAffected() != 1 {
+			return fmt.Errorf("failed to update balance: expected 1 row affected, got %d", rows.RowsAffected())
+		}
+
+		// add transaction history
+		const addHistoryQuery = `INSERT INTO transaction
+    							 (id, from_id, to_id, amount, created_at) 
+								 VALUES ($1, $2, $3, $4, $5)`
+		_, err = tx.Exec(ctx, addHistoryQuery, uuid.NewString(), fromUserID, toUserID, amount, now)
+		if err != nil {
+			return fmt.Errorf("failed to insert transaction history: %w", err)
+		}
+
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func (s *UserService) GetShardManager() *shard.ShardManager {
+	return s.ShardManager
 }

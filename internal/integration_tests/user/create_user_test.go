@@ -13,21 +13,42 @@ import (
 )
 
 func TestCreateUser(t *testing.T) {
-	deps := pkg.SetupTest(t)
+	deps := pkg.SetupTest(t, pkg.Setup{})
 
-	phone := "+79133971113"
-	email := "test2@test.ru"
+	phone := "+79133971114"
+	email := "test4@test.ru"
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*10)
 	defer cancel()
-	userID, err := deps.UserService.CreateUser(ctx, phone, email)
+	userID, err := deps.UserSaga.CreateUser(ctx, phone, email)
 	require.NoError(t, err)
 	_, shardID, _ := id.ParseUserID(userID)
 	t.Log("created user with id:", userID, "shard_id:", shardID)
+
+	_, err = deps.UserSaga.CreateUser(ctx, phone, email)
+	require.Error(t, err)
+}
+
+func TestCreateUserWithSameNumberAndReturnEmail(t *testing.T) {
+	deps := pkg.SetupTest(t, pkg.Setup{})
+
+	phone := "+79133971114"
+	email := "test4@test.ru"
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute*10)
+	defer cancel()
+	userID, err := deps.UserSaga.CreateUser(ctx, phone, email)
+	require.NoError(t, err)
+	_, shardID, _ := id.ParseUserID(userID)
+	t.Log("created user with id:", userID, "shard_id:", shardID)
+
+	newEmail := "test5@test.ru"
+	_, err = deps.UserSaga.CreateUser(ctx, phone, newEmail)
+	require.Error(t, err)
 }
 
 func TestCreateManyUsers(t *testing.T) {
-	deps := pkg.SetupTest(t)
+	deps := pkg.SetupTest(t, pkg.Setup{})
 
 	counter := atomic.Uint32{}
 	const generatedData = 1000
@@ -45,7 +66,7 @@ func TestCreateManyUsers(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for data := range input {
-				_, err := deps.UserService.CreateUser(context.TODO(), data.Phone, data.Email)
+				_, err := deps.UserSaga.CreateUser(context.TODO(), data.Phone, data.Email)
 				require.NoError(t, err)
 				current := counter.Add(1)
 				if current%10 == 0 {

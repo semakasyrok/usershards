@@ -9,10 +9,6 @@ import (
 
 var Logger *zap.SugaredLogger
 
-func L() *zap.SugaredLogger {
-	return (*zap.SugaredLogger)(atomic.LoadPointer((*unsafe.Pointer)(unsafe.Pointer(&Logger))))
-}
-
 func InitLogger() {
 	sync.OnceFunc(func() {
 		logger, _ := zap.NewProduction()
