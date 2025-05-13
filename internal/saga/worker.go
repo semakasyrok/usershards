@@ -52,62 +52,54 @@ type userSagaService interface {
 	IncreaseMoney(ctx context.Context, params TransferMoneyParams) error
 }
 
+// startWorker is a helper function that starts a worker and waits for confirmation
+// that it has started successfully.
+func startWorker(w worker.Worker, workerName string) {
+	workerErrCh := make(chan error, 1)
+	stopChan := make(<-chan interface{}, 1)
+
+	go func() {
+		err := w.Run(stopChan)
+		if err != nil {
+			logger.Logger.Error(workerName+" worker error", zap.Error(err))
+		}
+		workerErrCh <- err
+	}()
+
+	// Wait for confirmation that the worker started
+	select {
+	case err := <-workerErrCh:
+		logger.Logger.Fatal(workerName+" worker failed to start", err)
+	case <-time.After(time.Second): // Give time for worker to start
+		logger.Logger.Info(workerName + " worker started successfully")
+	}
+}
+
 func NewWorker(temporalClient client.Client, service userSagaService) (worker.Worker, worker.Worker) {
-	w2 := worker.New(temporalClient, TaskQueue, worker.Options{})
+	// Create and start user worker
+	userWorker := worker.New(temporalClient, TaskQueue, worker.Options{})
 
-	// Регистрируем workflow
-	w2.RegisterWorkflow(service.CreateUserWorkflow)
+	// Register user workflow and activities
+	userWorker.RegisterWorkflow(service.CreateUserWorkflow)
+	userWorker.RegisterActivity(service.CreateUserRecord)
+	userWorker.RegisterActivity(service.CreateEmailRecord)
+	userWorker.RegisterActivity(service.DeleteUserRecordIfPresentByUserID)
+	userWorker.RegisterActivity(service.DeleteEmailRecordIfPresentByUserID)
 
-	w2.RegisterActivity(service.CreateUserRecord)
-	w2.RegisterActivity(service.CreateEmailRecord)
-	w2.RegisterActivity(service.DeleteUserRecordIfPresentByUserID)
-	w2.RegisterActivity(service.DeleteEmailRecordIfPresentByUserID)
+	// Start the user worker
+	startWorker(userWorker, "User")
 
-	workerErrCh2 := make(chan error, 1)
-	stopChan2 := make(<-chan interface{}, 1)
-	go func() {
-		err := w2.Run(stopChan2)
-		if err != nil {
-			logger.Logger.Error("worker error", zap.Error(err))
-		}
-		workerErrCh2 <- err
-	}()
+	// Create and start transfer worker
+	transferWorker := worker.New(temporalClient, TransferTaskQueue, worker.Options{})
 
-	// Ждём подтверждения, что worker запустился
-	select {
-	case err := <-workerErrCh2:
-		logger.Logger.Fatal("Worker failed to start", err)
-	case <-time.After(time.Second): // Даём время на старт worker'а
-		logger.Logger.Info("Worker started successfully")
-	}
+	// Register transfer workflow and activities
+	transferWorker.RegisterWorkflow(service.TransferMoneyWorkflow)
+	transferWorker.RegisterActivity(service.IncreaseMoney)
+	transferWorker.RegisterActivity(service.DecreaseMoney)
+	transferWorker.RegisterActivity(service.CompensateMoney)
 
-	//=========
+	// Start the transfer worker
+	startWorker(transferWorker, "Transfer")
 
-	w3 := worker.New(temporalClient, TransferTaskQueue, worker.Options{})
-
-	// Регистрируем workflow
-	w3.RegisterWorkflow(service.TransferMoneyWorkflow)
-	w3.RegisterActivity(service.IncreaseMoney)
-	w3.RegisterActivity(service.DecreaseMoney)
-	w3.RegisterActivity(service.CompensateMoney)
-
-	workerErrCh3 := make(chan error, 1)
-	stopChan3 := make(<-chan interface{}, 1)
-	go func() {
-		err := w3.Run(stopChan3)
-		if err != nil {
-			logger.Logger.Error("worker error", zap.Error(err))
-		}
-		workerErrCh3 <- err
-	}()
-
-	// Ждём подтверждения, что worker запустился
-	select {
-	case err := <-workerErrCh3:
-		logger.Logger.Fatal("Worker failed to start", err)
-	case <-time.After(time.Second): // Даём время на старт worker'а
-		logger.Logger.Info("Worker started successfully")
-	}
-
-	return w2, w3
+	return userWorker, transferWorker
 }
